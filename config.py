@@ -1,25 +1,31 @@
 """
-Configuration file for AI Resume Screener
+Configuration for the AI Resume Screener.
 """
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Gemini API Configuration
+# Gemini API
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# Scoring Weights
-SEMANTIC_SEARCH_WEIGHT = 0.6
-LLM_WEIGHT = 0.4
+# Hybrid scoring: retrieval similarity of resume chunks vs the job description,
+# plus the LLM evaluation of those retrieved chunks.
+RETRIEVAL_WEIGHT = 0.4
+LLM_WEIGHT = 0.6
 
-# Vector Database Configuration
-VECTOR_DB_PATH = "./vector_db"
-COLLECTION_NAME = "resumes"
+# Vector database
+VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", "./vector_db")
+COLLECTION_NAME = "resume_chunks"
 
-# Embedding Model
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # Lightweight and efficient
+# Embeddings (downloaded on first run)
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-# LLM Configuration
-LLM_MODEL = "gemini-2.0-flash"  # Available model (or use "gemini-pro-latest" for latest stable)
-TEMPERATURE = 0.3  # Lower temperature for more consistent matching
+# Gemini
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.0-flash")
+TEMPERATURE = 0.2
+
+# Resume chunking for retrieval
+CHUNK_SIZE = 700
+CHUNK_OVERLAP = 120
+TOP_K_CHUNKS = 5

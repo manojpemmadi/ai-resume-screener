@@ -1,108 +1,222 @@
 """
-RAG Pipeline combining Semantic Search and LLM Evaluation
+RAG resume screening pipeline.
+
+Flow:
+1. Clean resume and job-description text
+2. Split the resume into chunks
+3. Embed chunks and store them in ChromaDB
+4. Retrieve the chunks most similar to the job description
+5. Send retrieved context + job description to Gemini
+6. Combine retrieval similarity and the structured LLM evaluation
 """
-from vector_store import VectorStore
-from llm_evaluator import LLMEvaluator
+import uuid
+from typing import Dict, List, Optional
+
 import config
-from typing import Dict, List
+from llm_evaluator import LLMEvaluationError, LLMEvaluator
+from utils import clean_text, split_resume_into_chunks
+from vector_store import VectorStore
 
 
 class RAGResumeScreener:
-    """
-    Main RAG Pipeline for Resume Screening
-    Combines semantic search (0.6 weight) and LLM evaluation (0.4 weight)
-    """
-    
+    """Indexes a resume, retrieves relevant sections, then evaluates with Gemini."""
+
     def __init__(self):
         self.vector_store = VectorStore()
         self.llm_evaluator = LLMEvaluator()
-    
-    def screen_resume(self, resume_text: str, job_description: str) -> Dict:
-        """
-        Screen a resume against a job description using RAG pipeline
-        
-        Args:
-            resume_text: The candidate's resume text
-            job_description: The job description text
-            
-        Returns:
-            Dictionary containing:
-            - final_score: Weighted combination of semantic and LLM scores
-            - semantic_score: Score from semantic search (0-1)
-            - llm_score: Score from LLM evaluation (0-1)
-            - llm_details: Detailed LLM evaluation results
-            - recommendation: Overall recommendation
-        """
-        # Step 1: Semantic Search Evaluation (0.6 weight)
-        semantic_score = self.vector_store.calculate_semantic_score(
-            resume_text, job_description
-        )
-        
-        # Step 2: LLM Evaluation (0.4 weight)
-        llm_result = self.llm_evaluator.evaluate_match(resume_text, job_description)
-        llm_score = llm_result['score']
-        
-        # Step 3: Weighted Combination
-        final_score = (
-            semantic_score * config.SEMANTIC_SEARCH_WEIGHT +
-            llm_score * config.LLM_WEIGHT
-        )
-        
-        # Step 4: Generate Recommendation
-        recommendation = self._generate_recommendation(final_score)
-        
-        return {
-            'final_score': round(final_score, 3),
-            'semantic_score': round(semantic_score, 3),
-            'llm_score': round(llm_score, 3),
-            'llm_details': llm_result,
-            'recommendation': recommendation,
-            'weights': {
-                'semantic_search': config.SEMANTIC_SEARCH_WEIGHT,
-                'llm': config.LLM_WEIGHT
-            }
-        }
-    
+
+    def screen_resume(
+        self,
+        resume_text: str,
+        job_description: str,
+        resume_id: Optional[str] = None,
+    ) -> Dict:
+        resume_id = resume_id or f"resume_{uuid.uuid4().hex[:12]}"
+        job_description = clean_text(job_description)
+        resume_text = clean_text(resume_text)
+
+        if not job_description:
+            raise ValueError("Job description is empty after cleaning")
+        if not resume_text:
+            raise ValueError("Resume text is empty after cleaning")
+
+        chunks = split_resume_into_chunks(resume_text)
+        if not chunks:
+            raise ValueError("Resume could not be split into retrievable chunks")
+
+        self.vector_store.upsert_resume_chunks(resume_id, chunks)
+        return self._evaluate_indexed_resume(resume_id, job_description, chunk_count=len(chunks))
+
     def batch_screen_resumes(self, resumes: List[Dict], job_description: str) -> List[Dict]:
         """
-        Screen multiple resumes against a job description
-        
-        Args:
-            resumes: List of dictionaries with 'id' and 'text' keys
-            job_description: The job description text
-            
-        Returns:
-            List of screening results, sorted by final_score (descending)
+        Index every resume first, then retrieve and evaluate each one against the same JD.
+        Each item in `resumes` must include `text` and should include `id`.
         """
+        job_description = clean_text(job_description)
+        if not job_description:
+            raise ValueError("Job description is empty after cleaning")
+        if not resumes:
+            return []
+
+        indexed = []
         results = []
-        
-        for resume in resumes:
-            result = self.screen_resume(resume['text'], job_description)
-            result['resume_id'] = resume.get('id', 'unknown')
+
+        for index, resume in enumerate(resumes, start=1):
+            resume_id = str(resume.get("id") or f"resume_{index}")
+            resume_text = clean_text(resume.get("text") or "")
+            if not resume_text:
+                results.append(
+                    self._error_result(
+                        resume_id,
+                        "Resume text is empty after cleaning",
+                        error_type="invalid_input",
+                    )
+                )
+                continue
+            try:
+                chunks = split_resume_into_chunks(resume_text)
+                if not chunks:
+                    raise ValueError("Resume could not be split into retrievable chunks")
+                self.vector_store.upsert_resume_chunks(resume_id, chunks)
+                indexed.append({"resume_id": resume_id, "chunk_count": len(chunks)})
+            except Exception as exc:
+                results.append(
+                    self._error_result(
+                        resume_id,
+                        str(exc),
+                        error_type="indexing_error",
+                    )
+                )
+
+        for item in indexed:
+            result = self._evaluate_indexed_resume(
+                item["resume_id"],
+                job_description,
+                chunk_count=item["chunk_count"],
+            )
+            result["resume_id"] = item["resume_id"]
             results.append(result)
-        
-        # Sort by final score (highest first)
-        results.sort(key=lambda x: x['final_score'], reverse=True)
-        
+
+        results.sort(
+            key=lambda item: (
+                0 if item.get("status") == "success" else 1,
+                -(item.get("final_score") if item.get("final_score") is not None else -1.0),
+            )
+        )
         return results
-    
-    def _generate_recommendation(self, score: float) -> str:
-        """Generate recommendation based on final score"""
+
+    def _evaluate_indexed_resume(
+        self,
+        resume_id: str,
+        job_description: str,
+        chunk_count: Optional[int] = None,
+    ) -> Dict:
+        retrieved = self.vector_store.retrieve_resume_chunks(
+            job_description,
+            resume_id,
+            top_k=config.TOP_K_CHUNKS,
+        )
+        if not retrieved:
+            return self._error_result(
+                resume_id,
+                "No resume chunks were retrieved from ChromaDB for this candidate.",
+                error_type="retrieval_error",
+            )
+
+        retrieval_score = round(self.vector_store.retrieval_score(retrieved), 3)
+        retrieved_context = self._format_retrieved_context(retrieved)
+
+        try:
+            llm_result = self.llm_evaluator.evaluate_match(retrieved_context, job_description)
+        except LLMEvaluationError as exc:
+            return self._error_result(
+                resume_id,
+                str(exc),
+                error_type="llm_error",
+                extra={
+                    "retrieval_score": retrieval_score,
+                    "retrieved_chunks": retrieved,
+                    "chunk_count": chunk_count or len(retrieved),
+                },
+            )
+
+        llm_score = llm_result["score"]
+        final_score = round(
+            retrieval_score * config.RETRIEVAL_WEIGHT + llm_score * config.LLM_WEIGHT,
+            3,
+        )
+        recommendation = llm_result.get("recommendation") or self._recommendation_from_score(
+            final_score
+        )
+
+        return {
+            "status": "success",
+            "resume_id": resume_id,
+            "final_score": final_score,
+            "retrieval_score": retrieval_score,
+            "llm_score": llm_score,
+            "llm_details": llm_result,
+            "recommendation": recommendation,
+            "retrieved_chunks": retrieved,
+            "chunk_count": chunk_count or len(retrieved),
+            "weights": {
+                "retrieval": config.RETRIEVAL_WEIGHT,
+                "llm": config.LLM_WEIGHT,
+            },
+            "error": None,
+        }
+
+    @staticmethod
+    def _format_retrieved_context(retrieved: List[Dict]) -> str:
+        blocks = []
+        for index, chunk in enumerate(retrieved, start=1):
+            similarity = chunk.get("similarity", 0.0)
+            text = chunk.get("text", "").strip()
+            blocks.append(f"[Excerpt {index} | similarity={similarity:.2f}]\n{text}")
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _recommendation_from_score(score: float) -> str:
         if score >= 0.8:
-            return "Strongly Recommended - Excellent match"
-        elif score >= 0.65:
-            return "Recommended - Good match"
-        elif score >= 0.5:
-            return "Consider - Moderate match"
-        elif score >= 0.35:
-            return "Weak Match - Review carefully"
-        else:
-            return "Not Recommended - Poor match"
-    
-    def add_resume_to_index(self, resume_id: str, resume_text: str, metadata: Dict = None):
-        """Add a resume to the vector store for future searches"""
-        self.vector_store.add_resume(resume_id, resume_text, metadata)
-    
-    def add_job_to_index(self, job_id: str, job_description: str, metadata: Dict = None):
-        """Add a job description to the vector store"""
-        self.vector_store.add_job_description(job_id, job_description, metadata)
+            return "Strongly Recommended"
+        if score >= 0.65:
+            return "Recommended"
+        if score >= 0.5:
+            return "Consider"
+        if score >= 0.35:
+            return "Weak Match"
+        return "Not Recommended"
+
+    @staticmethod
+    def _error_result(
+        resume_id: str,
+        message: str,
+        error_type: str,
+        extra: Optional[Dict] = None,
+    ) -> Dict:
+        result = {
+            "status": "error",
+            "resume_id": resume_id,
+            "final_score": None,
+            "retrieval_score": None,
+            "llm_score": None,
+            "llm_details": {
+                "score": None,
+                "reasoning": message,
+                "matched_skills": [],
+                "missing_skills": [],
+                "recommendation": "",
+            },
+            "recommendation": None,
+            "retrieved_chunks": [],
+            "chunk_count": 0,
+            "weights": {
+                "retrieval": config.RETRIEVAL_WEIGHT,
+                "llm": config.LLM_WEIGHT,
+            },
+            "error": message,
+            "error_type": error_type,
+        }
+        if extra:
+            result.update(extra)
+        return result

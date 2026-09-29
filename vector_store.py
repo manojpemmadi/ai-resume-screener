@@ -1,103 +1,140 @@
 """
-Vector Store Management for Resume Embeddings
+ChromaDB vector store for resume chunks and job-description retrieval.
 """
+from typing import Dict, List, Optional
+
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict
+
 import config
 
 
 class VectorStore:
-    """Manages vector embeddings and semantic search"""
-    
-    def __init__(self):
+    """Embeds resume chunks, stores them in ChromaDB, and retrieves by job description."""
+
+    def __init__(self, persist_path: Optional[str] = None, collection_name: Optional[str] = None):
         self.embedding_model = SentenceTransformer(config.EMBEDDING_MODEL)
-        self.client = chromadb.PersistentClient(
-            path=config.VECTOR_DB_PATH,
-            settings=Settings(anonymized_telemetry=False)
-        )
+        db_path = persist_path or config.VECTOR_DB_PATH
+        try:
+            self.client = chromadb.PersistentClient(
+                path=db_path,
+                settings=Settings(anonymized_telemetry=False),
+            )
+        except TypeError:
+            self.client = chromadb.PersistentClient(path=db_path)
+        self.collection_name = collection_name or config.COLLECTION_NAME
         self.collection = self.client.get_or_create_collection(
-            name=config.COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"}
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"},
         )
-    
-    def add_resume(self, resume_id: str, resume_text: str, metadata: Dict = None):
-        """Add a resume to the vector store"""
-        embedding = self.embedding_model.encode(resume_text).tolist()
-        
-        self.collection.add(
-            ids=[resume_id],
-            embeddings=[embedding],
-            documents=[resume_text],
-            metadatas=[metadata or {}]
-        )
-    
-    def add_job_description(self, job_id: str, job_description: str, metadata: Dict = None):
-        """Add a job description to the vector store"""
-        embedding = self.embedding_model.encode(job_description).tolist()
-        
-        self.collection.add(
-            ids=[f"job_{job_id}"],
-            embeddings=[embedding],
-            documents=[job_description],
-            metadatas=[metadata or {}]
-        )
-    
-    def semantic_search(self, query_text: str, top_k: int = 5) -> List[Dict]:
+
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        vectors = self.embedding_model.encode(texts, show_progress_bar=False)
+        return vectors.tolist()
+
+    def delete_resume(self, resume_id: str) -> None:
+        existing = self.collection.get(where={"resume_id": resume_id})
+        ids = existing.get("ids") or []
+        if ids:
+            self.collection.delete(ids=ids)
+
+    def upsert_resume_chunks(
+        self,
+        resume_id: str,
+        chunks: List[str],
+        extra_metadata: Optional[Dict] = None,
+    ) -> int:
         """
-        Perform semantic search on resumes/job descriptions
-        Returns list of matches with scores
+        Replace any previous chunks for this resume_id, then insert the new ones.
+        Returns the number of chunks stored.
         """
-        query_embedding = self.embedding_model.encode(query_text).tolist()
-        
+        if not resume_id:
+            raise ValueError("resume_id is required")
+        if not chunks:
+            raise ValueError("Cannot index an empty resume")
+
+        self.delete_resume(resume_id)
+        embeddings = self.embed_texts(chunks)
+        ids = [f"{resume_id}::chunk::{index}" for index in range(len(chunks))]
+        metadatas = []
+        for index, _chunk in enumerate(chunks):
+            metadata = {
+                "resume_id": resume_id,
+                "chunk_index": index,
+                "doc_type": "resume_chunk",
+            }
+            if extra_metadata:
+                for key, value in extra_metadata.items():
+                    if value is not None and isinstance(value, (str, int, float, bool)):
+                        metadata[key] = value
+            metadatas.append(metadata)
+
+        self.collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            documents=chunks,
+            metadatas=metadatas,
+        )
+        return len(chunks)
+
+    def count_resume_chunks(self, resume_id: str) -> int:
+        result = self.collection.get(where={"resume_id": resume_id})
+        return len(result.get("ids") or [])
+
+    def retrieve_resume_chunks(
+        self,
+        job_description: str,
+        resume_id: str,
+        top_k: int = None,
+    ) -> List[Dict]:
+        """
+        Retrieve the resume chunks that are most similar to the job description.
+        Similarity is cosine similarity derived from Chroma cosine distance.
+        """
+        chunk_count = self.count_resume_chunks(resume_id)
+        if chunk_count == 0:
+            return []
+
+        k = min(top_k or config.TOP_K_CHUNKS, chunk_count)
+        query_embedding = self.embed_texts([job_description])[0]
         results = self.collection.query(
             query_embeddings=[query_embedding],
-            n_results=top_k
+            n_results=k,
+            where={"resume_id": resume_id},
+            include=["documents", "metadatas", "distances"],
         )
-        
+
         matches = []
-        if results['ids'] and len(results['ids'][0]) > 0:
-            for i in range(len(results['ids'][0])):
-                # Convert distance to similarity score (1 - distance for cosine similarity)
-                distance = results['distances'][0][i]
-                similarity = 1 - distance  # Cosine distance to similarity
-                
-                matches.append({
-                    'id': results['ids'][0][i],
-                    'text': results['documents'][0][i],
-                    'similarity': similarity,
-                    'metadata': results['metadatas'][0][i] if results['metadatas'] else {}
-                })
-        
-        return matches
-    
-    def calculate_semantic_score(self, resume_text: str, job_description: str) -> float:
-        """
-        Calculate semantic similarity score between resume and job description
-        Returns a score between 0 and 1
-        """
-        matches = self.semantic_search(job_description, top_k=1)
-        
-        if matches:
-            # Use the best match score
-            return matches[0]['similarity']
-        else:
-            # If no matches, calculate direct similarity
-            resume_embedding = self.embedding_model.encode(resume_text)
-            job_embedding = self.embedding_model.encode(job_description)
-            
-            # Cosine similarity
-            import numpy as np
-            similarity = np.dot(resume_embedding, job_embedding) / (
-                np.linalg.norm(resume_embedding) * np.linalg.norm(job_embedding)
+        ids = (results.get("ids") or [[]])[0]
+        documents = (results.get("documents") or [[]])[0]
+        distances = (results.get("distances") or [[]])[0]
+        metadatas = (results.get("metadatas") or [[]])[0]
+
+        for index, chunk_id in enumerate(ids):
+            distance = float(distances[index]) if index < len(distances) else 1.0
+            similarity = max(0.0, min(1.0, 1.0 - distance))
+            matches.append(
+                {
+                    "id": chunk_id,
+                    "text": documents[index] if index < len(documents) else "",
+                    "similarity": round(similarity, 4),
+                    "metadata": metadatas[index] if index < len(metadatas) else {},
+                }
             )
-            return float(similarity)
-    
-    def clear_collection(self):
-        """Clear all documents from the collection"""
-        self.client.delete_collection(name=config.COLLECTION_NAME)
+        return matches
+
+    def retrieval_score(self, matches: List[Dict]) -> float:
+        """Average cosine similarity of retrieved chunks (0-1)."""
+        if not matches:
+            return 0.0
+        return float(sum(match["similarity"] for match in matches) / len(matches))
+
+    def clear_collection(self) -> None:
+        self.client.delete_collection(name=self.collection_name)
         self.collection = self.client.get_or_create_collection(
-            name=config.COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"}
+            name=self.collection_name,
+            metadata={"hnsw:space": "cosine"},
         )

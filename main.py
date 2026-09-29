@@ -1,92 +1,107 @@
 """
-Main script for AI Resume Screener
+Command-line entry point for the AI Resume Screener.
 """
-from rag_pipeline import RAGResumeScreener
 import json
 import sys
 
+from rag_pipeline import RAGResumeScreener
+from utils import clean_text
 
-def main():
-    """Main function for AI Resume Screener"""
-    
-    # Initialize the RAG pipeline
-    print("Initializing AI Resume Screener...")
-    screener = RAGResumeScreener()
-    
-    # Get job description
-    print("\nEnter job description (press Enter twice to finish):")
-    job_description_lines = []
+
+def _read_multiline(prompt: str) -> str:
+    print(f"\n{prompt} (press Enter on an empty line to finish):")
+    lines = []
     while True:
         try:
             line = input()
-            if line == "" and job_description_lines and job_description_lines[-1] == "":
-                break
-            job_description_lines.append(line)
         except EOFError:
             break
-    
-    job_description = "\n".join(job_description_lines).strip()
-    
+        if line == "":
+            break
+        lines.append(line)
+    return clean_text("\n".join(lines))
+
+
+def _print_result(result: dict) -> None:
+    print("\n" + "=" * 60)
+    print("SCREENING RESULT")
+    print("=" * 60)
+
+    if result.get("status") != "success":
+        print("\nStatus: ERROR (not a candidate score)")
+        print(f"Error type: {result.get('error_type')}")
+        print(f"Details: {result.get('error')}")
+        if result.get("retrieval_score") is not None:
+            print(f"Retrieval score (partial): {result['retrieval_score']:.1%}")
+        return
+
+    print(f"\nFinal score: {result['final_score']:.1%}")
+    print(f"Recommendation: {result['recommendation']}")
+    print("\nScore breakdown")
+    print(
+        f"  Retrieval score: {result['retrieval_score']:.1%} "
+        f"(weight {result['weights']['retrieval']})"
+    )
+    print(
+        f"  LLM score: {result['llm_score']:.1%} "
+        f"(weight {result['weights']['llm']})"
+    )
+
+    details = result.get("llm_details") or {}
+    if details.get("reasoning"):
+        print("\nLLM reasoning")
+        print(f"  {details['reasoning']}")
+    if details.get("matched_skills"):
+        print("\nMatched skills")
+        for skill in details["matched_skills"]:
+            print(f"  - {skill}")
+    if details.get("missing_skills"):
+        print("\nMissing skills")
+        for skill in details["missing_skills"]:
+            print(f"  - {skill}")
+
+    retrieved = result.get("retrieved_chunks") or []
+    if retrieved:
+        print(f"\nRetrieved excerpts ({len(retrieved)} of {result.get('chunk_count')} chunks)")
+        for index, chunk in enumerate(retrieved, start=1):
+            preview = (chunk.get("text") or "").replace("\n", " ")[:180]
+            print(f"  {index}. similarity={chunk.get('similarity', 0):.2f} | {preview}")
+
+
+def main() -> None:
+    print("Initializing AI Resume Screener...")
+    try:
+        screener = RAGResumeScreener()
+    except Exception as exc:
+        print(f"Failed to initialize screener: {exc}")
+        sys.exit(1)
+
+    job_description = _read_multiline("Enter job description")
     if not job_description:
         print("Error: Job description cannot be empty")
         sys.exit(1)
-    
-    # Get resume text
-    print("\nEnter resume text (press Enter twice to finish):")
-    resume_lines = []
-    while True:
-        try:
-            line = input()
-            if line == "" and resume_lines and resume_lines[-1] == "":
-                break
-            resume_lines.append(line)
-        except EOFError:
-            break
-    
-    resume_text = "\n".join(resume_lines).strip()
-    
+
+    resume_text = _read_multiline("Enter resume text")
     if not resume_text:
         print("Error: Resume text cannot be empty")
         sys.exit(1)
-    
-    print("\n" + "="*60)
-    print("Screening Resume against Job Description")
-    print("="*60)
-    
-    # Screen the resume
-    result = screener.screen_resume(resume_text, job_description)
-    
-    # Display results
-    print("\n[SCREENING RESULTS]")
-    print(f"\nFinal Score: {result['final_score']:.1%}")
-    print(f"Recommendation: {result['recommendation']}")
-    
-    print(f"\n[SCORE BREAKDOWN]")
-    print(f"  Semantic Search Score: {result['semantic_score']:.1%} (Weight: {result['weights']['semantic_search']})")
-    print(f"  LLM Evaluation Score: {result['llm_score']:.1%} (Weight: {result['weights']['llm']})")
-    
-    if result['llm_details'].get('reasoning'):
-        print(f"\n[LLM REASONING]")
-        print(f"  {result['llm_details']['reasoning']}")
-    
-    if result['llm_details'].get('matched_skills'):
-        print(f"\n[MATCHED SKILLS]")
-        for skill in result['llm_details']['matched_skills']:
-            print(f"  - {skill}")
-    
-    if result['llm_details'].get('missing_skills'):
-        print(f"\n[MISSING SKILLS]")
-        for skill in result['llm_details']['missing_skills']:
-            print(f"  - {skill}")
-    
-    print("\n" + "="*60)
-    
-    # Save results to JSON
-    output_file = 'screening_result.json'
-    with open(output_file, 'w') as f:
-        json.dump(result, f, indent=2)
-    
-    print(f"\n[SUCCESS] Results saved to '{output_file}'")
+
+    print("\nIndexing resume, retrieving relevant sections, and evaluating with Gemini...")
+    try:
+        result = screener.screen_resume(resume_text, job_description)
+    except Exception as exc:
+        print(f"Screening failed: {exc}")
+        sys.exit(1)
+
+    _print_result(result)
+
+    output_file = "screening_result.json"
+    with open(output_file, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2, default=str)
+    print(f"\nResults saved to '{output_file}'")
+
+    if result.get("status") != "success":
+        sys.exit(1)
 
 
 if __name__ == "__main__":
